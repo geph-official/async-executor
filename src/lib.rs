@@ -19,18 +19,19 @@
 //! ```
 
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
-
-use std::future::Future;
+mod scheduler;
 use std::marker::PhantomData;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Poll, Waker};
+use std::{cell::UnsafeCell, future::Future};
 
 use async_task::Runnable;
 use concurrent_queue::ConcurrentQueue;
 use futures_lite::{future, prelude::*};
+use scheduler::Scheduler;
 use vec_arena::Arena;
 
 #[doc(no_inline)]
@@ -177,7 +178,7 @@ impl<'a> Executor<'a> {
 
     /// Returns a reference to the inner scheduler.
     fn sched(&self) -> &Arc<Scheduler> {
-        self.sched.get_or_init(|| Default::default())
+        self.sched.get_or_init(Default::default)
     }
 }
 
@@ -325,7 +326,7 @@ impl<'a> LocalExecutor<'a> {
 
     /// Returns a reference to the inner scheduler.
     fn sched(&self) -> &Arc<Scheduler> {
-        self.sched.get_or_init(|| Default::default())
+        self.sched.get_or_init(Default::default)
     }
 }
 
