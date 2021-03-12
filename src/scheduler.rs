@@ -101,6 +101,11 @@ impl Scheduler {
         }
     }
 
+    /// Checks if the executor is empty and has no pending tasks to run.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.state.lock().active.is_empty()
+    }
+
     /// Runs a single task.
     pub(crate) async fn tick(&self) {
         let mut ticker = Ticker {

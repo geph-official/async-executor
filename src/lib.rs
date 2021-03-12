@@ -93,6 +93,11 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Checks if the executor is empty and has no pending tasks to run.
+    pub fn is_empty(&self) -> bool {
+        self.sched().is_empty()
+    }
+
     /// Spawns a task onto the executor.
     ///
     /// # Examples
@@ -239,6 +244,11 @@ impl<'a> LocalExecutor<'a> {
             sched: once_cell::unsync::OnceCell::new(),
             _marker: PhantomData,
         }
+    }
+
+    /// Checks if the executor is empty and has no pending tasks to run.
+    pub fn is_empty(&self) -> bool {
+        self.sched().is_empty()
     }
 
     /// Spawns a task onto the executor.
