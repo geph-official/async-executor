@@ -20,17 +20,17 @@
 
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
-use std::future::Future;
 use std::marker::PhantomData;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Poll, Waker};
+use std::{future::Future, sync::Arc};
 
 use async_task::Runnable;
 use concurrent_queue::ConcurrentQueue;
 use futures_lite::{future, prelude::*};
+use parking_lot::{Mutex, RwLock};
 use vec_arena::Arena;
 
 #[doc(no_inline)]
@@ -111,7 +111,7 @@ impl<'a> Executor<'a> {
     /// assert!(ex.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        self.state().active.lock().unwrap().is_empty()
+        self.state().active.lock().is_empty()
     }
 
     /// Spawns a task onto the executor.
@@ -128,13 +128,13 @@ impl<'a> Executor<'a> {
     /// });
     /// ```
     pub fn spawn<T: Send + 'a>(&self, future: impl Future<Output = T> + Send + 'a) -> Task<T> {
-        let mut active = self.state().active.lock().unwrap();
+        let mut active = self.state().active.lock();
 
         // Remove the task from the set of active tasks when the future finishes.
         let index = active.next_vacant();
         let state = self.state().clone();
         let future = async move {
-            let _guard = CallOnDrop(move || drop(state.active.lock().unwrap().remove(index)));
+            let _guard = CallOnDrop(move || drop(state.active.lock().remove(index)));
             future.await
         };
 
@@ -256,7 +256,7 @@ impl<'a> Executor<'a> {
 impl Drop for Executor<'_> {
     fn drop(&mut self) {
         if let Some(state) = self.state.get() {
-            let mut active = state.active.lock().unwrap();
+            let mut active = state.active.lock();
             for i in 0..active.capacity() {
                 if let Some(w) = active.remove(i) {
                     w.wake();
@@ -356,13 +356,13 @@ impl<'a> LocalExecutor<'a> {
     /// });
     /// ```
     pub fn spawn<T: 'a>(&self, future: impl Future<Output = T> + 'a) -> Task<T> {
-        let mut active = self.inner().state().active.lock().unwrap();
+        let mut active = self.inner().state().active.lock();
 
         // Remove the task from the set of active tasks when the future finishes.
         let index = active.next_vacant();
         let state = self.inner().state().clone();
         let future = async move {
-            let _guard = CallOnDrop(move || drop(state.active.lock().unwrap().remove(index)));
+            let _guard = CallOnDrop(move || drop(state.active.lock().remove(index)));
             future.await
         };
 
@@ -449,7 +449,7 @@ impl<'a> LocalExecutor<'a> {
 
     /// Returns a reference to the inner executor.
     fn inner(&self) -> &Executor<'a> {
-        self.inner.get_or_init(|| Executor::new())
+        self.inner.get_or_init(Executor::new)
     }
 }
 
@@ -502,7 +502,7 @@ impl State {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let waker = self.sleepers.lock().unwrap().notify();
+            let waker = self.sleepers.lock().notify();
             if let Some(w) = waker {
                 w.wake();
             }
@@ -615,7 +615,7 @@ impl Ticker<'_> {
     ///
     /// Returns `false` if the ticker was already sleeping and unnotified.
     fn sleep(&self, waker: &Waker) -> bool {
-        let mut sleepers = self.state.sleepers.lock().unwrap();
+        let mut sleepers = self.state.sleepers.lock();
 
         match self.sleeping.load(Ordering::SeqCst) {
             // Move to sleeping state.
@@ -642,7 +642,7 @@ impl Ticker<'_> {
     fn wake(&self) {
         let id = self.sleeping.swap(0, Ordering::SeqCst);
         if id != 0 {
-            let mut sleepers = self.state.sleepers.lock().unwrap();
+            let mut sleepers = self.state.sleepers.lock();
             sleepers.remove(id);
 
             self.state
@@ -690,7 +690,7 @@ impl Drop for Ticker<'_> {
         // If this ticker is in sleeping state, it must be removed from the sleepers list.
         let id = self.sleeping.swap(0, Ordering::SeqCst);
         if id != 0 {
-            let mut sleepers = self.state.sleepers.lock().unwrap();
+            let mut sleepers = self.state.sleepers.lock();
             let notified = sleepers.remove(id);
 
             self.state
@@ -733,11 +733,7 @@ impl Runner<'_> {
             local: Arc::new(ConcurrentQueue::bounded(512)),
             ticks: AtomicUsize::new(0),
         };
-        state
-            .local_queues
-            .write()
-            .unwrap()
-            .push(runner.local.clone());
+        state.local_queues.write().push(runner.local.clone());
         runner
     }
 
@@ -758,7 +754,7 @@ impl Runner<'_> {
                 }
 
                 // Try stealing from other runners.
-                let local_queues = self.state.local_queues.read().unwrap();
+                let local_queues = self.state.local_queues.read();
 
                 // Pick a random starting point in the iterator list and rotate the list.
                 let n = local_queues.len();
@@ -802,7 +798,6 @@ impl Drop for Runner<'_> {
         self.state
             .local_queues
             .write()
-            .unwrap()
             .retain(|local| !Arc::ptr_eq(local, &self.local));
 
         // Re-schedule remaining tasks in the local queue.
