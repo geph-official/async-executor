@@ -32,6 +32,7 @@ use std::{marker::PhantomData, sync::Weak};
 
 use async_task::Runnable;
 use concurrent_queue::ConcurrentQueue;
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use futures_lite::{future, prelude::*};
 use parking_lot::{Mutex, RwLock};
 use thread_local::ThreadLocal;
@@ -172,16 +173,19 @@ impl<'a> Executor<'a> {
     /// assert!(ex.try_tick()); // a task was found
     /// ```
     pub fn try_tick(&self) -> bool {
-        match self.state().queue.pop() {
-            Err(_) => false,
-            Ok(runnable) => {
-                // Notify another ticker now to pick up where this ticker left off, just in case
-                // running the task takes a long time.
-                self.state().notify();
+        loop {
+            match self.state().queue.steal() {
+                Steal::Retry => continue,
+                Steal::Empty => return false,
+                Steal::Success(runnable) => {
+                    // Notify another ticker now to pick up where this ticker left off, just in case
+                    // running the task takes a long time.
+                    self.state().notify();
 
-                // Run the task.
-                runnable.run();
-                true
+                    // Run the task.
+                    runnable.run();
+                    return true;
+                }
             }
         }
     }
@@ -255,7 +259,7 @@ impl<'a> Executor<'a> {
             // if !lqq.is_empty() {
             //     lqq[0].push(runnable).unwrap();
             // } else {
-            state.queue.push(runnable).unwrap();
+            state.queue.push(runnable);
             // }
             state.notify();
         }
@@ -278,7 +282,13 @@ impl Drop for Executor<'_> {
             }
             drop(active);
 
-            while state.queue.pop().is_ok() {}
+            loop {
+                match state.queue.steal() {
+                    Steal::Success(val) => drop(val),
+                    Steal::Retry => continue,
+                    Steal::Empty => break,
+                }
+            }
         }
     }
 }
@@ -456,7 +466,7 @@ impl<'a> LocalExecutor<'a> {
         let state = self.inner().state().clone();
 
         move |runnable| {
-            state.queue.push(runnable).unwrap();
+            state.queue.push(runnable);
             state.notify();
         }
     }
@@ -477,10 +487,10 @@ impl<'a> Default for LocalExecutor<'a> {
 #[derive(Debug)]
 struct State {
     /// The global queue.
-    queue: ConcurrentQueue<Runnable>,
+    queue: Injector<Runnable>,
 
     /// Local queues created by runners.
-    local_queues: RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>,
+    local_queues: RwLock<Arena<Stealer<Runnable>>>,
 
     /// Set to `true` when a sleeping ticker is notified or no tickers are sleeping.
     notified: AtomicBool,
@@ -496,8 +506,8 @@ impl State {
     /// Creates state for a new executor.
     fn new() -> State {
         State {
-            queue: ConcurrentQueue::unbounded(),
-            local_queues: RwLock::new(Vec::new()),
+            queue: Injector::new(),
+            local_queues: RwLock::new(Arena::new()),
             notified: AtomicBool::new(true),
             sleepers: Mutex::new(Sleepers {
                 count: 0,
@@ -667,7 +677,14 @@ impl Ticker {
 
     /// Waits for the next runnable task to run.
     async fn runnable(&self) -> Runnable {
-        self.runnable_with(|| self.state.queue.pop().ok()).await
+        self.runnable_with(|| loop {
+            match self.state.queue.steal() {
+                Steal::Success(val) => break Some(val),
+                Steal::Empty => break None,
+                Steal::Retry => continue,
+            }
+        })
+        .await
     }
 
     /// Waits for the next runnable task to run, given a function that searches for a task.
@@ -732,23 +749,28 @@ struct Runner {
     ticker: Ticker,
 
     /// The local queue.
-    local: Arc<ConcurrentQueue<Runnable>>,
+    local: Worker<Runnable>,
 
     /// Bumped every time a runnable task is found.
     ticks: AtomicUsize,
+
+    /// Worker ID.
+    worker_id: usize,
 }
 
 impl Runner {
     /// Creates a runner and registers it in the executor state.
     fn new(state: Arc<State>) -> Runner {
-        let runner = Runner {
+        let local = Worker::new_lifo();
+        let worker_id = state.local_queues.write().insert(local.stealer());
+
+        Runner {
             state: state.clone(),
-            ticker: Ticker::new(state.clone()),
-            local: Arc::new(ConcurrentQueue::unbounded()),
+            ticker: Ticker::new(state),
+            local,
             ticks: AtomicUsize::new(0),
-        };
-        state.local_queues.write().push(runner.local.clone());
-        runner
+            worker_id,
+        }
     }
 
     /// Waits for the next runnable task to run.
@@ -756,44 +778,24 @@ impl Runner {
         let runnable = self
             .ticker
             .runnable_with(|| {
-                // Try the local queue.
-                if let Ok(r) = self.local.pop() {
-                    // eprintln!("got from local queue");
-                    return Some(r);
-                }
-
-                // Try stealing from the global queue.
-                if let Ok(r) = self.state.queue.pop() {
-                    // eprintln!("got from global queue");
-                    // steal(&self.state.queue, &self.local);
-                    return Some(r);
-                }
-
-                // // Try stealing from other runners.
-                // let local_queues = self.state.local_queues.read();
-
-                // // Pick a random starting point in the iterator list and rotate the list.
-                // let n = local_queues.len();
-                // let start = fastrand::usize(..n);
-                // let iter = local_queues
-                //     .iter()
-                //     .chain(local_queues.iter())
-                //     .skip(start)
-                //     .take(n);
-
-                // // Remove this runner's local queue.
-                // let iter = iter.filter(|local| !Arc::ptr_eq(local, &self.local));
-
-                // // Try stealing from each local queue in the list.
-                // for local in iter {
-                //     eprintln!("got from others' queues");
-                //     steal(local, &self.local);
-                //     if let Ok(r) = self.local.pop() {
-                //         return Some(r);
-                //     }
-                // }
-
-                None
+                self.local.pop().or_else(|| {
+                    std::iter::repeat_with(|| {
+                        self.state
+                            .queue
+                            .steal_batch_and_pop(&self.local)
+                            .or_else(|| {
+                                self.state
+                                    .local_queues
+                                    .read()
+                                    .iter()
+                                    .filter(|(id, _)| *id != self.worker_id)
+                                    .map(|s| s.1.steal())
+                                    .collect()
+                            })
+                    })
+                    .find(|s| !s.is_retry())
+                    .and_then(|s| s.success())
+                })
             })
             .await;
 
@@ -815,10 +817,10 @@ impl Drop for Runner {
         self.state
             .local_queues
             .write()
-            .retain(|local| !Arc::ptr_eq(local, &self.local));
+            .retain(|i, _| i != self.worker_id);
 
         // Re-schedule remaining tasks in the local queue.
-        while let Ok(r) = self.local.pop() {
+        while let Some(r) = self.local.pop() {
             r.schedule();
         }
     }
