@@ -20,12 +20,15 @@
 
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
-use std::marker::PhantomData;
-use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
+use std::{
+    cell::RefCell,
+    panic::{RefUnwindSafe, UnwindSafe},
+};
 use std::{future::Future, sync::Arc};
+use std::{marker::PhantomData, sync::Weak};
 
 use async_task::Runnable;
 use concurrent_queue::ConcurrentQueue;
@@ -246,8 +249,14 @@ impl<'a> Executor<'a> {
         let state = self.state().clone();
 
         // TODO(stjepang): If possible, push into the current local queue and notify the ticker.
+        // TODO(nullchinchilla): Make sure this is safe
         move |runnable| {
+            // let lqq = state.local_queues.read();
+            // if !lqq.is_empty() {
+            //     lqq[0].push(runnable).unwrap();
+            // } else {
             state.queue.push(runnable).unwrap();
+            // }
             state.notify();
         }
     }
@@ -735,7 +744,7 @@ impl Runner {
         let runner = Runner {
             state: state.clone(),
             ticker: Ticker::new(state.clone()),
-            local: Arc::new(ConcurrentQueue::bounded(512)),
+            local: Arc::new(ConcurrentQueue::unbounded()),
             ticks: AtomicUsize::new(0),
         };
         state.local_queues.write().push(runner.local.clone());
@@ -749,49 +758,52 @@ impl Runner {
             .runnable_with(|| {
                 // Try the local queue.
                 if let Ok(r) = self.local.pop() {
+                    // eprintln!("got from local queue");
                     return Some(r);
                 }
 
                 // Try stealing from the global queue.
                 if let Ok(r) = self.state.queue.pop() {
-                    steal(&self.state.queue, &self.local);
+                    // eprintln!("got from global queue");
+                    // steal(&self.state.queue, &self.local);
                     return Some(r);
                 }
 
-                // Try stealing from other runners.
-                let local_queues = self.state.local_queues.read();
+                // // Try stealing from other runners.
+                // let local_queues = self.state.local_queues.read();
 
-                // Pick a random starting point in the iterator list and rotate the list.
-                let n = local_queues.len();
-                let start = fastrand::usize(..n);
-                let iter = local_queues
-                    .iter()
-                    .chain(local_queues.iter())
-                    .skip(start)
-                    .take(n);
+                // // Pick a random starting point in the iterator list and rotate the list.
+                // let n = local_queues.len();
+                // let start = fastrand::usize(..n);
+                // let iter = local_queues
+                //     .iter()
+                //     .chain(local_queues.iter())
+                //     .skip(start)
+                //     .take(n);
 
-                // Remove this runner's local queue.
-                let iter = iter.filter(|local| !Arc::ptr_eq(local, &self.local));
+                // // Remove this runner's local queue.
+                // let iter = iter.filter(|local| !Arc::ptr_eq(local, &self.local));
 
-                // Try stealing from each local queue in the list.
-                for local in iter {
-                    steal(local, &self.local);
-                    if let Ok(r) = self.local.pop() {
-                        return Some(r);
-                    }
-                }
+                // // Try stealing from each local queue in the list.
+                // for local in iter {
+                //     eprintln!("got from others' queues");
+                //     steal(local, &self.local);
+                //     if let Ok(r) = self.local.pop() {
+                //         return Some(r);
+                //     }
+                // }
 
                 None
             })
             .await;
 
-        // Bump the tick counter.
-        let ticks = self.ticks.fetch_add(1, Ordering::SeqCst);
+        // // Bump the tick counter.
+        // let ticks = self.ticks.fetch_add(1, Ordering::SeqCst);
 
-        if ticks % 64 == 0 {
-            // Steal tasks from the global queue to ensure fair task scheduling.
-            steal(&self.state.queue, &self.local);
-        }
+        // if ticks % 64 == 0 {
+        //     // Steal tasks from the global queue to ensure fair task scheduling.
+        //     steal(&self.state.queue, &self.local);
+        // }
 
         runnable
     }
