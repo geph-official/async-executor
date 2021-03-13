@@ -28,7 +28,7 @@ use std::{
     panic::{RefUnwindSafe, UnwindSafe},
 };
 use std::{future::Future, sync::Arc};
-use std::{marker::PhantomData, sync::Weak};
+use std::{marker::PhantomData, rc::Weak};
 
 use async_task::Runnable;
 use concurrent_queue::ConcurrentQueue;
@@ -67,9 +67,6 @@ pub use async_task::Task;
 /// ```
 #[derive(Debug)]
 pub struct Executor<'a> {
-    /// A thread-local runner.
-    runner: once_cell::sync::OnceCell<ThreadLocal<Runner>>,
-
     /// The executor state.
     state: once_cell::sync::OnceCell<Arc<State>>,
 
@@ -95,7 +92,6 @@ impl<'a> Executor<'a> {
     /// ```
     pub const fn new() -> Executor<'a> {
         Executor {
-            runner: once_cell::sync::OnceCell::new(),
             state: once_cell::sync::OnceCell::new(),
             _marker: PhantomData,
         }
@@ -232,7 +228,7 @@ impl<'a> Executor<'a> {
     /// ```
     pub async fn run<T>(&self, future: impl Future<Output = T>) -> T {
         let runner = Runner::new(self.state().clone());
-
+        LOCAL_RUNQUEUE.with(|v| *v.borrow_mut() = Rc::downgrade(&runner.local));
         // A future that runs tasks forever.
         let run_forever = async {
             loop {
@@ -255,12 +251,12 @@ impl<'a> Executor<'a> {
         // TODO(stjepang): If possible, push into the current local queue and notify the ticker.
         // TODO(nullchinchilla): Make sure this is safe
         move |runnable| {
-            // let lqq = state.local_queues.read();
-            // if !lqq.is_empty() {
-            //     lqq[0].push(runnable).unwrap();
-            // } else {
-            state.queue.push(runnable);
-            // }
+            if let Some(queue) = LOCAL_RUNQUEUE.with(|v| v.borrow().upgrade()) {
+                // eprintln!("SAW LOCAL!");
+                queue.push(runnable);
+            } else {
+                state.queue.push(runnable);
+            }
             state.notify();
         }
     }
@@ -749,7 +745,7 @@ struct Runner {
     ticker: Ticker,
 
     /// The local queue.
-    local: Worker<Runnable>,
+    local: Rc<Worker<Runnable>>,
 
     /// Bumped every time a runnable task is found.
     ticks: AtomicUsize,
@@ -758,10 +754,14 @@ struct Runner {
     worker_id: usize,
 }
 
+thread_local! {
+    static LOCAL_RUNQUEUE: RefCell<Weak<Worker<Runnable>>> = RefCell::new(Weak::new())
+}
+
 impl Runner {
     /// Creates a runner and registers it in the executor state.
     fn new(state: Arc<State>) -> Runner {
-        let local = Worker::new_lifo();
+        let local = Rc::new(Worker::new_lifo());
         let worker_id = state.local_queues.write().insert(local.stealer());
 
         Runner {
