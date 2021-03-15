@@ -48,7 +48,7 @@ impl LocalQueue {
     }
 
     pub fn pop(&self) -> Option<Runnable> {
-        self.inner.lock().pop_back()
+        self.inner.lock().pop_front()
     }
 
     pub fn steal_global(&self, other: &GlobalQueue) {
@@ -75,18 +75,18 @@ impl LocalQueue {
     pub fn steal_local(&self, other: &LocalQueue) {
         // let mut inner = self.inner.lock();
         // let mut their_inner = other.inner.lock();
-        let count = (other.inner.lock().len() + 1) / 2;
+        // let count = (other.inner.lock().len() + 1) / 2;
 
-        if count > 0 {
-            // Steal tasks.
-            for _ in 0..count {
-                if let Some(t) = other.inner.lock().pop_back() {
-                    // assert!(self.inner.push(t).is_ok());
-                    self.inner.lock().push_front(t);
-                } else {
-                    break;
-                }
-            }
-        }
+        // if count > 0 {
+        //     // Steal tasks.
+        //     for _ in 0..count {
+        //         if let Some(t) = other.inner.lock().pop_back() {
+        //             // assert!(self.inner.push(t).is_ok());
+        //             self.inner.lock().push_front(t);
+        //         } else {
+        //             break;
+        //         }
+        //     }
+        // }
     }
 }
