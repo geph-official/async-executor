@@ -227,10 +227,10 @@ impl<'a> Executor<'a> {
     /// ```
     pub async fn run<T>(&self, future: impl Future<Output = T>) -> T {
         let runner = Runner::new(self.state().clone());
-        runner.set_tls_active();
         // A future that runs tasks forever.
         let run_forever = async {
             loop {
+                runner.set_tls_active();
                 for _ in 0..200 {
                     let runnable = runner.runnable().await;
                     runnable.run();
@@ -719,7 +719,7 @@ impl Drop for Ticker {
 }
 
 thread_local! {
-    static TLS: RefCell<(Weak<Ticker>, Weak<LocalQueue>)> = RefCell::new((Weak::new(), Weak::new()))
+    static TLS: RefCell<(Option<Arc<Ticker>>, Option<Arc<LocalQueue>>)> = Default::default()
 }
 
 fn try_push_tls(runnable: Runnable) -> Result<(), Runnable> {
@@ -729,7 +729,7 @@ fn try_push_tls(runnable: Runnable) -> Result<(), Runnable> {
     }
     TLS.with(|tls| {
         let tls = tls.borrow();
-        if let (Some(ticker), Some(queue)) = (tls.0.upgrade(), tls.1.upgrade()) {
+        if let (Some(ticker), Some(queue)) = (&tls.0, &tls.1) {
             if let Err(err) = queue.push(runnable) {
                 return Err(err);
             }
@@ -744,10 +744,6 @@ fn try_push_tls(runnable: Runnable) -> Result<(), Runnable> {
             Err(runnable)
         }
     })
-}
-
-fn clear_tls() {
-    TLS.with(|v| *v.borrow_mut() = Default::default())
 }
 
 /// A worker in a work-stealing executor.
@@ -787,9 +783,9 @@ impl Runner {
 
     /// Sets as active in the TLS
     fn set_tls_active(&self) {
-        let weak_ticker = Arc::downgrade(&self.ticker);
-        let weak_local = Arc::downgrade(&self.local);
-        TLS.with(|tls| *tls.borrow_mut() = (weak_ticker, weak_local))
+        // let weak_ticker = Arc::downgrade(&self.ticker);
+        // let weak_local = Arc::downgrade(&self.local);
+        TLS.with(|tls| *tls.borrow_mut() = (Some(self.ticker.clone()), Some(self.local.clone())))
     }
 
     /// Waits for the next runnable task to run.
